@@ -1,0 +1,213 @@
+---
+title: "project"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+library(usmap)
+library(ggplot2)
+library(tidyverse)
+library(shiny)
+library(leaflet)
+library(rgdal)
+library(rgeos)
+library(dplyr)
+library(RColorBrewer)
+library(ggplot2)
+library(maptools)
+library(mapproj)
+```
+
+# read asthma csv
+
+```{r}
+asthma<-read.csv('asthma1911.csv')
+summary(asthma)
+```
+
+
+
+# read state shape file
+
+```{r}
+uhfsShapeFile <- readOGR('./usmap-master/data-raw/maps/cb_2017_us_state_20m', 'cb_2017_us_state_20m')
+uhfs <- spTransform(uhfsShapeFile, CRS("+proj=longlat +datum=WGS84 +no_defs"))
+```
+
+
+# map asthma state to fips
+```{r}
+asthma['STATEFP'] <- uhfs$STATEFP[match(asthma$US_STATE, uhfs$NAME)]
+asthma<-asthma %>% drop_na()
+```
+
+
+# subset by selected attributes
+
+```{r}
+subsetter <- function(metricSelect, childSelect, sexSelect, ageSelect,ethnicitySelect, raceSelect){
+  df <- asthma
+  df <- filter(df,METRIC_NAME%in%metricSelect,CHILD_OR_ADULT %in%childSelect, SEX %in% sexSelect, AGE_GROUP %in% ageSelect,ETHNICITY %in%ethnicitySelect, RACE %in% raceSelect)
+  dens <- setNames(aggregate(DENOMINATOR ~ STATEFP, df, sum), c('STATEFP', 'DENOMINATOR'))
+  nums <- setNames(aggregate(NUMERATOR ~ STATEFP, df, sum), c('STATEFP', 'NUMERATOR'))
+  uhfData <- merge(merge(uhfs, nums, by='STATEFP'), dens, by='STATEFP')
+  uhfData$percentage <- uhfData$NUMERATOR / uhfData$DENOMINATOR
+  return(uhfData)
+}
+```
+
+
+
+# build ui
+
+```{r}
+ui <- bootstrapPage(
+  tags$style(type = "text/css", "html, body {width:100%;height:100%}"),
+  leafletOutput("mymap", width='80%', height='70%'),
+  plotOutput('plot', width='70%', height='30%'),
+  absolutePanel(top=10, right=-120,
+                selectInput("measure", "Color by:",
+                            c('NUMERATOR', 'DENOMINATOR', 'percentage'), 'percentage',
+                            width='50%'
+                ),
+                checkboxGroupInput("SEX", "SEX",
+                                   unique(asthma$SEX), 
+                                   'ALL'
+                ),
+                               checkboxGroupInput("ETHNICITY", "ETHNICITY",
+                                   unique(asthma$ETHNICITY), 
+                                   'ALL'
+                ),
+                checkboxGroupInput("AGE_GROUP", "AGE",
+                                   unique(asthma$AGE_GROUP),
+                                   'ALL'
+                ),
+                checkboxGroupInput("RACE", "RACE",
+                                   unique(asthma$RACE), 
+                                   'ALL'
+                ),
+                checkboxGroupInput("CHILD_OR_ADULT", "CHILD_OR_ADULT",
+                                unique(asthma$CHILD_OR_ADULT),
+                                'ALL'
+                ),
+                checkboxGroupInput("METRIC_NAME", "METRIC_NAME",
+                                   unique(asthma$METRIC_NAME),
+                                   'ASTHMA'
+                )
+
+                )
+  )
+
+
+```
+
+# connect to server
+
+```{r}
+
+server <- function(input, output, session) {
+
+# select subset  
+  subDf <- reactive({
+    validate(
+      need(input$METRIC_NAME, 'Select at least one metric category.'),
+      need(input$CHILD_OR_ADULT, 'Select at least one child or adult category.'),
+      need(input$SEX, 'Select at least one sex category.'),
+      need(input$AGE_GROUP, 'Select at least one age category.'),
+      need(input$ETHNICITY, 'Select at least one ethnicity category.'),
+      need(input$RACE, 'Select at least one race category.')
+    )
+
+
+    subsetter(input$METRIC_NAME,input$CHILD_OR_ADULT, input$SEX, input$AGE_GROUP, input$ETHNICITY, input$RACE)
+  })
+
+# color by measure    
+  colorPal <- reactive({
+    colorQuantile('YlOrRd', domain=subDf()$input$measure)
+  })
+
+# district label print
+  labels <- reactive({
+    sprintf(
+      "<strong>%s</strong><br/>NUMERATOR: %d<br/>DENOMINATOR: %d<br/>percentage: %f",
+      subDf()$NAME, subDf()$NUMERATOR, subDf()$DENOMINATOR, subDf()$percentage
+    ) %>% lapply(htmltools::HTML)
+  })
+  
+  # create a reactive value that will store the click position
+  data_of_click <- reactiveValues(clickedShape=NULL)
+  
+  output$mymap <- renderLeaflet({
+    leaflet(subDf()) %>%
+      setView(-93, 41, zoom=4) %>%
+      addTiles()
+      # addProviderTiles("MapBox", options = providerTileOptions(
+      #   id = "mapbox.light",
+      #   accessToken = Sys.getenv('MAPBOX_ACCESS_TOKEN')))
+  })
+  
+  observe({
+    pal <- colorPal()
+    leafletProxy('mymap', data=subDf()) %>%
+      clearShapes() %>%
+      addPolygons(
+        fillColor = ~pal(get(input$measure)),
+        weight = 2,
+        opacity = 1,
+        color = "white",
+        dashArray = "3",
+        fillOpacity = 0.7,
+        label = labels(),
+        labelOptions = labelOptions(
+          style = list("font-weight" = "normal", padding = "3px 8px"),
+          textsize = "15px",
+          direction = "auto"),
+        layerId=~STATEFP
+      )
+  })
+  
+  # store the click
+  observeEvent(input$mymap_shape_click,{
+    data_of_click$clickedShape <- input$mymap_shape_click
+  })
+  
+  
+  
+  
+    output$plot=renderPlot({
+    selectUHF=data_of_click$clickedShape$id
+    row=subset(subDf(), STATEFP==selectUHF)
+    rowRate <- row$NUMERATOR/row$DENOMINATOR
+    totNum <- sum(subDf()$NUMERATOR, na.rm=TRUE)
+    totDen <- sum(subDf()$DENOMINATOR, na.rm=TRUE)
+    totRate <- totNum/totDen
+    # plotData <- data.frame(geography=c(as.character(row$UHFNAME), 'NYC - overall'),
+    #                        rate=c(rowRate, totRate))
+    plotData <- data.frame(geography=factor(c(as.character(row$NAME), 'US - overall'), 
+                                            levels=c(as.character(row$NAME), 'US - overall')),
+                           rate=c(rowRate, totRate))
+    ggplot(data=plotData, aes(x=geography, y=rate)) + 
+      geom_bar(stat='identity') +
+      geom_text(aes(label=round(rate, digits=2)), vjust=-0.3, size=3.5) +
+      theme_minimal()
+    # myPlot <- barplot(c(rowRate, totRate), 
+    #         names.arg=c(as.character(row$UHFNAME), 'NYC - overall'),
+    #         ylim=c(0,0.25),
+    #         ylab='asthma rate',
+    #         col='steelblue1')
+    # text(x = myPlot, y = c(rowRate, totRate), label = c(round(rowRate, digits=2), round(totRate, digits=2)), pos = 3, cex = 0.8, col = "red")
+  })
+  
+}
+```
+
+
+```{r}
+shinyApp(ui, server)
+```
